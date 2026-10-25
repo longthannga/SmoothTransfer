@@ -26,8 +26,9 @@ from settings import get_setting, set_setting
 from workload import HOURS_PER_UNIT, units_for_codes
 from terms import shift_year
 
-st.set_page_config(page_title="SmoothTransfer", page_icon="🎓", layout="wide")
-st.title("🎓 SmoothTransfer")
+import branding
+st.set_page_config(page_title="SmoothTransfer", page_icon=branding.page_icon(), layout="wide")
+branding.render_header()   # the logo file if it is there, else the 🎓 title
 st.caption("Live transfer requirements from ASSIST, and a plan that changes when life does.")
 
 CAMPUS = "UC San Diego"  # only campus with a known ASSIST ID so far (Foothill = 51, UCSD = 7)
