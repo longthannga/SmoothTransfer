@@ -1,5 +1,12 @@
 """Cal-GETC area definitions for a planning checklist, not an official evaluator.
 
+Counts checked against the Cal-GETC Standards (v1.3) and several California community colleges' official 2025-26 Cal-GETC
+sheets: 11 courses and 34 semester units in all. Area 1: three courses (1A, 1B, 1C). Area 2: one. Area 3: two (one Arts,
+one Humanities). Area 4: two, from at least two disciplines. Area 5: one physical science (5A) and one biological science
+(5B), and at least one of them must include a lab (5C, which is not a separate course). Area 6: one. A course needs at
+least 3 semester or 4 quarter units (labs excepted), and a grade of C or better. Area 1C is listed with a "check your
+pathway" note because not every source treats it the same way for UC.
+
 Course/score equivalency must be confirmed against the student's catalog year,
 college articulation, and official Cal-GETC/AP/IB guidance.
 """

@@ -16,10 +16,12 @@ import streamlit as st
 from streamlit_sortables import sort_items
 
 import calgetc_list as gcl
+import external_exams as xe
 import store
 from cal_getc import CAL_GETC_AREAS
 from settings import get_setting, set_setting
 from terms import term_label
+from workload import quarter_hours
 from transcript_match import PASSING, BELOW_C, parse_note
 
 # Layout, tested in a real browser. This package lays its boxes out side by side only when the
@@ -183,39 +185,40 @@ def planned_entries(needed, listing, taken):
 
 
 def check_placements(courses, placements, listing):
-    """Every placed course against the official list. Returns rows {course, area, ok, says}."""
+    """Every placed course or exam against the official list or the Standards. Returns rows {course, area, ok, says}."""
     rows = []
     for c in courses:
         area = placements.get(c["key"])
-        if not area:
+        if not area or (not listing and not c.get("areas")):
             continue
-        info = gcl.areas_for(listing, c["code"], c.get("term", ""))
+        info = gcl.info_for(listing, c)
         names = ", ".join(a for a in info["areas"]) or "none"
         if area in info["areas"]:
-            ok, says = True, "On the list for this area"
+            ok, says = True, ("Cal-GETC Standards allow this" if c.get("areas") else "On the list for this area")
         elif info["status"] == "not_listed":
-            ok, says = False, "Not on Foothill's Cal-GETC list"
+            ok, says = False, f"Not on {gcl.college_of(listing)}'s Cal-GETC list"
         elif info["status"] == "not_approved_then":
             ok, says = False, "On the list, but not approved for the quarter it was taken"
         else:
-            ok, says = False, f"The list names Area {names} for this course, not {area}"
+            what = "exam" if c.get("areas") else "course"
+            ok, says = False, f"The {'Standards name' if c.get('areas') else 'list names'} Area {names} for this {what}, not {area}"
         rows.append({"course": c["code"], "area": area, "ok": ok, "says": says})
     return rows
 
 
 def why_unplaced(courses, placements, listing):
-    """For each course left in the pool, what the official list says about it."""
+    """For each course or exam left in the pool, what the official list or the Standards say about it."""
     out = {}
     for c in courses:
-        if placements.get(c["key"]):
+        if placements.get(c["key"]) or (not listing and not c.get("areas")):
             continue
-        info = gcl.areas_for(listing, c["code"], c.get("term", ""))
+        info = gcl.info_for(listing, c)
         if info["status"] == "not_listed":
-            out[c["code"]] = "Not on Foothill's Cal-GETC list, so it does not count for any area"
+            out[c["code"]] = f"Not on {gcl.college_of(listing)}'s Cal-GETC list, so it does not count for any area"
         elif info["status"] == "not_approved_then":
             out[c["code"]] = "On the list, but not for the quarter it was taken"
         else:
-            out[c["code"]] = (f"On the list for Area {', '.join(info['areas'])}, but not placed "
+            out[c["code"]] = (f"Can count for Area {', '.join(a for a in info['areas'] if a != '5C') or '5C'}, but not placed "
                               "(those areas already have enough courses, or you moved it out)")
     return out
 
@@ -224,6 +227,14 @@ def why_unplaced(courses, placements, listing):
 
 PLACEHOLDER_UNITS = (4, 6)   # quarter units a Cal-GETC course usually has
 PLAN_UNITS = 5               # what the planner counts for each placeholder (the real course may be 4 to 6)
+SEMESTER_PLAN_UNITS, SEMESTER_PLACEHOLDER_UNITS = 3, (3, 4)   # a Cal-GETC course is at least 3 semester units
+
+
+def unit_plan(system="quarter"):
+    """(units counted for a placeholder in the plan, (lowest, highest) the real course may be) for a term system."""
+    return (SEMESTER_PLAN_UNITS, SEMESTER_PLACEHOLDER_UNITS) if system == "semester" else (PLAN_UNITS, PLACEHOLDER_UNITS)
+
+
 NO_PLACEHOLDER = {"5C"}      # the lab is normally part of a 5A or 5B science course, not a separate course
 
 
@@ -253,31 +264,37 @@ def slot_title(slot):
     return f"{title} · Cal-GETC {slot['area']}"
 
 
-def placeholder_reqs(slots, names=None):
+def placeholder_reqs(slots, names=None, units=None, system="quarter"):
     """One planner requirement per missing course. Each can only be met by its own placeholder
-    course, so the planner, the checker and the board treat it like any other course."""
-    lo, hi = PLACEHOLDER_UNITS
-    names = names or {}
+    course, so the planner, the checker and the board treat it like any other course.
+    `units` holds the real units of courses the student picked from the official list ({placeholder code: units}).
+    A picked course counts its exact units. Any other placeholder counts 5 and may really be 4 to 6."""
+    plan_u, (lo, hi) = unit_plan(system)
+    names, units = names or {}, units or {}
     out = []
     for s in slots:
         code = f"CAL-GETC {s['area']} #{s['n']}"
         generic = slot_title(s)
         name = (names.get(code) or "").strip()   # the student's own name for this course, if they gave one
+        exact = _num(units.get(code)) or None    # real units of a course picked from the list
+        u, u_lo, u_hi = (exact, exact, exact) if exact else (plan_u, lo, hi)
         out.append({
             "course": f"Cal-GETC {s['area']} #{s['n']}",
             "title": f"{name} · Cal-GETC {s['area']}" if name else generic, "generic_title": generic,
-            "units": PLAN_UNITS,
+            "units": u,
             "section_id": f"calgetc-{s['area']}-{s['n']}", "pick_n_of_section": None, "status": "articulated",
-            "options": [[{"code": code, "units": PLAN_UNITS}]], "note": None,
-            "placeholder": True, "units_min": lo, "units_max": hi, "area_id": s["area"], "short": s["short"],
+            "options": [[{"code": code, "units": u}]], "note": None,
+            "placeholder": True, "units_min": u_lo, "units_max": u_hi, "area_id": s["area"], "short": s["short"],
         })
     return out
 
 
-def apply_names(plan, names):
+def apply_names(plan, names, units=None, system="quarter"):
     """Update the placeholder cards already in a plan (also in finished quarters) to the student's names.
-    A card with no name goes back to its generic title, like 'Arts course · Cal-GETC 3A'."""
-    names = names or {}
+    A card with no name goes back to its generic title, like 'Arts course · Cal-GETC 3A'.
+    With `units` ({placeholder code: real units}), a picked card also gets its exact units, and each quarter's
+    totals and weekly hours are redone. Finished quarters keep the units they had."""
+    names, units = names or {}, units or {}
     for key in ("quarters", "past_quarters"):
         for q in plan.get(key, []):
             for c in q.get("courses", []):
@@ -288,6 +305,14 @@ def apply_names(plan, names):
                 c.setdefault("generic_title", generic)
                 name = (names.get(c["code"]) or "").strip()
                 c["title"] = f"{name} · Cal-GETC {area}" if name else c["generic_title"]
+                if key == "quarters":
+                    exact = _num(units.get(c["code"])) or None
+                    plan_u, (lo, hi) = unit_plan(system)
+                    c["units"], c["units_min"], c["units_max"] = (exact, exact, exact) if exact else (plan_u, lo, hi)
+                    c["units_label"] = f"{c['units_min']:g}" if c["units_min"] == c["units_max"] else f"{c['units_min']:g}-{c['units_max']:g}"
+            if key == "quarters":
+                q["total_units"] = sum(_num(c.get("units")) for c in q.get("courses", []))
+                q.update(quarter_hours(q.get("courses", [])))
     return plan
 
 
@@ -339,15 +364,19 @@ def placed_by_area(profile_code, saved_courses):
 # ---------- Streamlit ----------
 
 def render_cal_getc_board(profile_code, saved_courses, ensure_profile, pending=None, on_use_pending=None,
-                          needed=(), list_info=None, on_reload=None, plan_start=""):
+                          needed=(), list_info=None, on_reload=None, plan_start="", exams=()):
     """The board. `ensure_profile()` creates a profile when none is open (called only on save).
     `pending` is a transcript the student already uploaded and reviewed but has not saved yet
     ({"name", "rows"}). `on_use_pending()` saves it, so the student never has to upload twice.
     `needed` is what the major still requires (planner.needed_courses). `list_info` is the result of
-    calgetc_list.load_list. With it the courses are placed for the student; without it they place them by hand."""
+    calgetc_list.load_list. With it the courses are placed for the student; without it they place them by hand.
+    `exams` are the student's saved AP and IB credits (store.list_exam_credits). Those that count for a Cal-GETC
+    area (see external_exams.py) are placed too, with or without the course list."""
     info = placeable(saved_courses)
     listing = (list_info or {}).get("listing")
-    courses = info["courses"] + (planned_entries(needed, listing, info["courses"]) if listing else [])
+    exam_cards, exam_skipped = xe.exam_entries(exams)
+    college = (list_info or {}).get("college") or "Foothill"
+    courses = info["courses"] + exam_cards + (planned_entries(needed, listing, info["courses"]) if listing else [])
     st.markdown("**Place your courses**")
     if not info["courses"] and pending and on_use_pending:     # uploaded once above but not saved yet
         st.info(f"You uploaded {pending['name']} ({len(pending['rows'])} courses) but have not saved it yet. "
@@ -368,8 +397,9 @@ def render_cal_getc_board(profile_code, saved_courses, ensure_profile, pending=N
 
     # ---- place courses from the official list: once per course, so the student's own moves are never undone ----
     auto = {}
-    if listing:
-        todo = [c for c in courses if c["key"] not in saved and c["key"] not in done]
+    if listing or exam_cards:
+        todo = [c for c in courses if c["key"] not in saved and c["key"] not in done
+                and (listing or c.get("areas"))]
         if todo:
             orphans = {gcl.course_key(k): a for k, a in full.items() if k not in keys}   # e.g. planned MATH 1B -> transcript MATH F001B
             carried = {c["key"]: orphans[gcl.course_key(c["code"])] for c in todo if gcl.course_key(c["code"]) in orphans}
@@ -385,7 +415,7 @@ def render_cal_getc_board(profile_code, saved_courses, ensure_profile, pending=N
     if listing:
         through = gcl.valid_through(listing)
         first = gcl.term_from_text(plan_start)
-        src = "ASSIST's Cal-GETC list" if listing.get("source") == "assist_api" else "Foothill's official Cal-GETC list"
+        src = "ASSIST's Cal-GETC list" if listing.get("source") == "assist_api" else f"{college}'s official Cal-GETC list"
         st.caption(f"Courses are placed for you from {src} for {listing.get('year') or 'this year'}"
                    f"{' (published ' + listing['generated'] + ')' if listing.get('generated') else ''}. "
                    "Drag a card to change it. Courses your major still needs are listed under the board. "
@@ -396,19 +426,19 @@ def render_cal_getc_board(profile_code, saved_courses, ensure_profile, pending=N
             st.warning(list_info.get("message", "Using the last saved copy of the list."))
         if through is not None and first is not None and first > through:
             st.warning(f"This list covers courses taken through {term_label(through)}, and your plan starts later. "
-                       "Approvals can change each year, so check the newer list if Foothill has published it "
+                       f"Approvals can change each year, so check the newer list if {college} has published it "
                        "(paste its link under “Use a different list” below).")
     else:
         why = (list_info or {}).get("message")
         if why:
-            st.warning(f"Foothill's official Cal-GETC list is not available ({why}) so nothing was placed for you. "
+            st.warning(f"{college}'s official Cal-GETC list is not available ({why}) so nothing was placed for you. "
                        "Place your courses by hand, or try again.")
             if on_reload and st.button("Try loading the list again", key="gcb_reload"):
                 on_reload()
                 st.rerun()
         st.caption("Drag each course into the Cal-GETC area you plan to use it for. SmoothTransfer counts "
                    "them, but it cannot tell whether a course is approved for an area. Check each course "
-                   "against Foothill's official Cal-GETC list, or with a counselor.")
+                   f"against {college}'s official Cal-GETC list, or with a counselor.")
 
     mode = st.radio("How do you want to place courses?", ["Drag and drop", "Menus"],
                     horizontal=True, key="gcb_mode")
@@ -426,7 +456,7 @@ def render_cal_getc_board(profile_code, saved_courses, ensure_profile, pending=N
         df = pd.DataFrame({
             "Course": [c["code"] for c in taken], "Title": [c["title"] for c in taken],
             "Units": [c["units"] for c in taken],
-            "Status": ["in progress" if c["state"] == "in_progress" else "done" for c in taken],
+            "Status": ["exam" if c.get("areas") else "in progress" if c["state"] == "in_progress" else "done" for c in taken],
             "Cal-GETC area": [start.get(c["key"], NOT_PLACED) for c in taken],
         }, index=[c["key"] for c in taken])
         edited = st.data_editor(
@@ -438,7 +468,7 @@ def render_cal_getc_board(profile_code, saved_courses, ensure_profile, pending=N
 
     # ---- courses the major still needs: a plain list under the board, not cards ----
     if planned:
-        st.markdown("**Can be used from your major:**")
+        st.markdown("**Cal-GETC courses satisfied from your major**")
         st.caption("These come from your ASSIST requirements, not from your transcript, so they are not on the "
                    "board. Each one can also count for a Cal-GETC area, and then it is not added to your plan "
                    "a second time. Change the area, or choose “Not used for Cal-GETC”.")
@@ -455,8 +485,7 @@ def render_cal_getc_board(profile_code, saved_courses, ensure_profile, pending=N
             if pick != NOT_PLACED:
                 new[c["key"]] = pick
 
-    st.markdown("**Cal-GETC Requirements Still Needed:**")
-    lab = gcl.lab_keys(courses, new, listing) if listing else set()
+    lab = gcl.lab_keys(courses, new, listing)          # works without a list too: an exam names its own lab
     rows = summarize(new, courses, lab)
     st.dataframe(pd.DataFrame([{
         "Area": f"{r['id']} · {r['name']}", "Usually needed": r["needed"], "Taken": r["taken"],
@@ -478,18 +507,24 @@ def render_cal_getc_board(profile_code, saved_courses, ensure_profile, pending=N
         st.caption("Not placeable: " + "; ".join(f"{c} ({why})" for c, why in info["blocked"])
                    + ". Cal-GETC needs a C or better.")
 
+    if exam_skipped:
+        st.caption("Not counted toward Cal-GETC: " + "; ".join(f"{n} ({why})" for n, why in exam_skipped) + ".")
+    if exam_cards and any(new.get(c["key"]) for c in exam_cards):
+        st.caption("AP and IB exams each count for one area, and credit is not given for both an exam and a "
+                   "college course on the same material, so do not take a course you are counting by exam.")
+
     # ---- every placement checked against the list ----
-    if listing:
+    if listing or exam_cards:
         checks = check_placements(courses, new, listing)
         bad = [r for r in checks if not r["ok"]]
         if bad:
-            st.warning("Not on Foothill's official list for that area: "
+            st.warning(f"Not on {college}'s official list for that area: "
                        + "; ".join(f"{r['course']} in Area {r['area']} ({r['says']})" for r in bad)
                        + ". Move the card, or check with a counselor.")
         with st.expander("Where each placement comes from"):
             if checks:
                 st.dataframe(pd.DataFrame([{"Course": r["course"], "Area": r["area"],
-                                            "Foothill's list": r["says"]} for r in checks]), hide_index=True)
+                                            f"{college}'s list" if college != "Foothill" else "Foothill's list": r["says"]} for r in checks]), hide_index=True)
             left = why_unplaced(courses, new, listing)
             if left:
                 st.markdown("**Not placed**")

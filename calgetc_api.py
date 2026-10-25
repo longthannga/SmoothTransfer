@@ -13,6 +13,7 @@ not hold enough courses with a recognizable area, we say so and fall back to the
   load_best(...)       the API list first, then the Foothill PDF if the API list is not available
 """
 import hashlib
+import os
 import json
 import re
 import time
@@ -22,6 +23,7 @@ import calgetc_list as gcl
 from cal_getc import CAL_GETC_AREAS
 
 AREA_IDS = {a["id"] for a in CAL_GETC_AREAS}
+FOOTHILL_ID = 51          # the one college whose PDF list is built in as a backup
 _HINT = re.compile(r"area|transfer|getc|requirement|attribute", re.I)   # keys that may hold an area
 _AREA_KEYS = ("areaCode", "area", "transferAreaCode", "areaId", "code")
 _AREA_VALUE = re.compile(r"^\s*(?:cal[\s-]*getc[\s:_-]*)?(?:area[\s:_-]*)?([1-6][A-C]?)(?![0-9A-Za-z])", re.I)
@@ -88,7 +90,45 @@ def _own_areas(course):
     return out
 
 
+def parse_native(data, year_label=""):
+    """ASSIST's transferability response: {"courseInformationList": [{"prefixCode", "courseNumber", "minUnits",
+    "transferAreas": [{"code": "3B", "beginTermCode": "F2025", "endTermCode": "F2026"}]}]}."""
+    courses = {}
+    stats = {"course_objects": 0, "with_area": 0, "area_entries": 0, "dated": 0}
+    for c in data.get("courseInformationList") or []:
+        if not isinstance(c, dict):
+            continue
+        stats["course_objects"] += 1
+        code = (c.get("identifier") or f'{c.get("prefixCode", "")} {c.get("courseNumber", "")}').strip()
+        areas = []
+        for a in c.get("transferAreas") or []:
+            area = str(a.get("code") or "").strip().upper()
+            if area in AREA_IDS and a.get("areaType", 8) == 8:
+                areas.append({"area": area, "approved": (a.get("beginTermCode") or "").strip(),
+                              "removed": (a.get("endTermCode") or "").strip()})
+        if not code or not areas:
+            continue
+        stats["with_area"] += 1
+        entry = courses.setdefault(gcl.course_key(code), {
+            "code": code, "title": str(c.get("courseTitle") or "").strip(),
+            "units": float(c.get("minUnits") or 0), "areas": [], "same_as": []})
+        for a in areas:
+            if not any(x["area"] == a["area"] and x["approved"] == a["approved"] for x in entry["areas"]):
+                entry["areas"].append(a)
+                stats["area_entries"] += 1
+                stats["dated"] += 1 if a["approved"] else 0
+    stats["dated_share"] = round(stats["dated"] / stats["area_entries"], 2) if stats["area_entries"] else 0.0
+    label = (data.get("academicYear") or {}).get("code") or year_label
+    return {"year": label, "generated": "", "courses": courses, "source": "assist_api", "stats": stats}
+
+
 def parse_api(data, year_label=""):
+    if isinstance(data, dict) and isinstance(data.get("courseInformationList"), list):
+        return parse_native(data, year_label)
+    return _parse_generic(data, year_label)
+
+
+def _parse_generic(data, year_label=""):
     """Raw ASSIST JSON -> {"year", "generated", "courses": {key: entry}, "source", "stats"}.
     An entry is {"code", "title", "units", "areas": [{"area", "approved", "removed"}], "same_as": []}."""
     courses = {}
@@ -163,7 +203,7 @@ def load_api_list(institution=51, year=77, force_live=False, page_url=None):
             return hit
     out = assist.fetch_calgetc(institution, year, page_url=page_url)
     if out["status"] != "ok":
-        reason = {"blocked": f"ASSIST refused the request (code {out.get('code')})",
+        reason = {"blocked": f"ASSIST refused the request (code {out.get('code')}). {out.get('detail') or ''}".strip(),
                   "slow": "ASSIST took too long to answer"}.get(out["status"], out.get("detail") or out["status"])
         old = gcl._cached(url, max_age_days=10 ** 6)
         if old:
@@ -203,10 +243,17 @@ def _note(listing):
 def load_best(url=None, force_live=False, institution=51, year=77, page_url=None):
     """The list the app should use. A PDF link the student typed wins. Otherwise ASSIST's list, and if that
     is not available, Foothill's PDF (the reason is kept in "fallback_reason")."""
+    # Foothill's own PDF link (saved from an earlier session or set in .env) must never be used for another college
+    foothill_pdfs = {gcl.DEFAULT_URL, (os.getenv("CALGETC_LIST_URL") or "").strip()}
+    if url and institution != FOOTHILL_ID and url.strip() in foothill_pdfs:
+        url = None
     if url:
         return gcl.load_list(url, force_live=force_live)
     api = load_api_list(institution, year, force_live=force_live, page_url=page_url)
     if api["status"] in ("ok", "cached", "stale"):
+        return api
+    if institution != FOOTHILL_ID:         # the backup PDF is Foothill's. Never show it for another college.
+        api["message"] = api.get("message", "") + " There is no backup list for this college, so nothing was placed from a list."
         return api
     pdf = gcl.load_list(None, force_live=force_live)
     if pdf["status"] in ("ok", "cached", "stale"):

@@ -199,10 +199,32 @@ def areas_for(listing, code, term_text=""):
     return {"areas": ok, "status": "ok" if ok else "not_approved_then", "entry": e, "term_known": t is not None}
 
 
+def info_for(listing, c):
+    """The areas a board card can count for. An AP or IB exam names its own (see external_exams.py), so it needs
+    no course list. A course comes from the official list, checked against the term it was taken."""
+    if c.get("areas"):
+        return {"areas": list(c["areas"]), "status": "ok", "entry": None, "term_known": False}
+    return areas_for(listing, c["code"], c.get("term", ""))
+
+
+def college_of(listing):
+    """The short name of the college a list belongs to. A list that does not say is Foothill's."""
+    return (listing or {}).get("college") or "Foothill"
+
+
+def _source(c, area, college="Foothill"):
+    """Where a placement comes from, in plain words."""
+    if c.get("areas"):
+        return f"Cal-GETC Standards: this exam counts for Area {area}"
+    return f"On {college}'s list for Area {area}"
+
+
 def _discipline(code):
     m = re.match(r"^([A-Z]+(?: [A-Z]{1,2})?) [A-Z]?\d", code.strip().upper())
     return m.group(1) if m else code.strip().upper()
 
+
+discipline = _discipline        # public name: "ECON 1A" -> "ECON"
 
 _RANK = {"done": 0, "in_progress": 1, "planned": 2}
 
@@ -228,11 +250,11 @@ def suggest_placements(courses, saved, listing):
     need = {a["id"]: max(int(a["courses"]) - have[a["id"]], 0) for a in CAL_GETC_AREAS if a["id"] != "5C"}
 
     todo = [c for c in courses if c["key"] not in saved]
-    todo.sort(key=lambda c: (_RANK.get(c["state"], 3), term_from_text(c.get("term")) or 0, c["key"]))
+    todo.sort(key=lambda c: (_RANK.get(c["state"], 3), 0 if c.get("areas") else 1, term_from_text(c.get("term")) or 0, c["key"]))
     cand, skipped, lab_only = {}, {}, []
     seen4 = set(taken_disciplines)
     for c in todo:
-        info = areas_for(listing, c["code"], c.get("term", ""))
+        info = info_for(listing, c)
         if info["status"] == "not_approved_then":
             skipped[c["key"]] = "It is on the list, but not for the quarter it was taken."
             continue
@@ -277,21 +299,23 @@ def suggest_placements(courses, saved, listing):
     notes = {}
     for k, area in placements.items():
         c = by_key[k]
-        info = areas_for(listing, c["code"], c.get("term", ""))
-        text = f"On Foothill's list for Area {area}"
+        info = info_for(listing, c)
+        text = _source(c, area, college_of(listing))
         others = [a for a in info["areas"] if a not in (area, "5C")]
         if others:
             text += f" (also approved for {', '.join(others)}, but it is needed here)"
         if area in ("5A", "5B") and "5C" in info["areas"]:
             text += "; it carries the lab (5C)"
+        if c.get("areas"):
+            text += ". Do not also take a college course for the same material: credit is not given for both"
         notes[k] = text
     for c in todo:
         k = c["key"]
         if k in placements or k in skipped:
             continue
-        info = areas_for(listing, c["code"], c.get("term", ""))
+        info = info_for(listing, c)
         if info["status"] == "not_listed":
-            skipped[k] = "Not on Foothill's Cal-GETC list."
+            skipped[k] = f"Not on {college_of(listing)}'s Cal-GETC list."
         elif k in cand or info["areas"]:
             skipped[k] = f"On the list (Area {', '.join(a for a in info['areas'] if a != '5C') or '5C'}), " \
                          "but those areas already have enough courses."
@@ -300,7 +324,7 @@ def suggest_placements(courses, saved, listing):
     if not any(merged.get(c["key"]) == "5C" for c in courses) and not lab_keys(courses, merged, listing):
         for c in lab_only:                             # a separate lab course, like ANTH 1L
             placements[c["key"]] = "5C"
-            notes[c["key"]] = "On Foothill's list for Area 5C (the lab)"
+            notes[c["key"]] = _source(c, "5C", college_of(listing)) + " (the lab)"
             break
     for c in lab_only:
         if c["key"] not in placements:
@@ -308,12 +332,28 @@ def suggest_placements(courses, saved, listing):
     return {"placements": placements, "notes": notes, "skipped": skipped}
 
 
+def courses_for_area(listing, area, exclude=()):
+    """Courses on the official list approved for an area, with their real units, for the student to pick from.
+    `exclude` holds course keys (see course_key) already used. A 1-unit lab on its own is not offered for an area
+    that needs a full course."""
+    out = []
+    for key, e in ((listing or {}).get("courses") or {}).items():
+        if key in exclude or not any(a["area"] == area for a in e["areas"]):
+            continue
+        if area != "5C" and float(e.get("units") or 0) < 3:
+            continue
+        removed = next((a["removed"] for a in e["areas"] if a["area"] == area and a["removed"]), "")
+        out.append({"key": key, "code": e["code"], "title": e["title"], "units": float(e.get("units") or 0),
+                    "lab": "5C" in [a["area"] for a in e["areas"]], "removed": removed})
+    return sorted(out, key=lambda c: (c["code"].split(" ")[0], len(c["code"]), c["code"]))
+
+
 def lab_keys(courses, placements, listing):
     """Keys of placed 5A/5B science courses whose list entry also carries the lab (5C)."""
     out = set()
     for c in courses:
         if placements.get(c["key"]) in ("5A", "5B"):
-            info = areas_for(listing, c["code"], c.get("term", ""))
+            info = info_for(listing, c)
             if "5C" in info["areas"]:
                 out.add(c["key"])
     return out

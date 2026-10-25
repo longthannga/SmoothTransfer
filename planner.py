@@ -22,20 +22,20 @@ MODEL = "claude-haiku-5-5"
 
 SYSTEM = """You are a transfer-planning assistant for California community college students.
 You receive JSON with: the target UC campus and major, a FIXED list "courses_to_schedule",
-the courses already completed, a short list of requirements that cannot be done at Foothill,
+the courses already completed, a short list of requirements that cannot be done at the community college,
 and the student's limits.
 
 Rules:
 - Schedule EVERY course in "courses_to_schedule", each exactly once. Do not add, swap, or
   drop courses. The choice of courses has already been made.
-- Foothill is on quarters. Plan by quarter.
+- The community college is named in "target". Plan by its term system, given as "term_system".
 - Prerequisite chains are not in the data. If you order courses using common sequences
   (for example MATH 1A before 1B), mark prereq_assumed true so the student verifies it.
 - Respect max_units per quarter. Mark each quarter light, moderate, or heavy and say why
   (for example several lab or heavy-math courses in one quarter).
 - Take the student's notes seriously (work hours, family). Heavy work hours mean lighter quarters.
 - Use plain, simple language. Keep each "why" under 12 words.
-- Requirements in "cannot_do_at_foothill_or_unknown" cannot be done at Foothill. Do not schedule them.
+- Requirements in "cannot_do_at_foothill_or_unknown" cannot be done at the community college. Do not schedule them.
   Return empty lists for "cannot_do_at_foothill" and "needs_check": the program fills those in.
 - "covered_by_ap" lists requirements the student already meets with AP exam credit. Never schedule
   courses for them. If it is not empty, say so briefly in the summary.
@@ -45,7 +45,9 @@ Rules:
   (units times the rule) and add any work or other hours the student mentions in their notes. A
   full-time job is about 40 hours a week, so say plainly when school plus work looks like too much,
   and suggest what to move. Use whole numbers and plain words.
-- Name every term with its season and year, for example "Winter 2027".
+- "term_system" is "quarter" or "semester". Where these rules say quarter, use the term system: a semester college
+  has Fall and Spring semesters (Summer is optional, and Winter is not a term). All units are in that system's units.
+- Name every term with its season and year, for example "Winter 2027" (or "Fall 2027" for a semester).
 - Plan only in terms up to "last_term_allowed" (the last quarter before the transfer goal). Do not use a
   Summer quarter unless "allow_summer_quarters" is true.
 - If "student_work_hours_per_week" is given, use it instead of any work hours in the student's notes.
@@ -133,7 +135,7 @@ def needed_courses(reqs, completed):
                                                     "satisfies": []})
                 if r.get("placeholder"):  # a Cal-GETC slot: the student has not picked the course yet
                     entry.update({"placeholder": True, "title": r["title"],
-                                  "units_range": f"{r['units_min']}-{r['units_max']}"})
+                                  "units_range": _units_label(r["units_min"], r["units_max"])})
                 if r["course"] not in entry["satisfies"]:
                     entry["satisfies"].append(r["course"])
             left -= 1
@@ -194,10 +196,10 @@ def _extract_json(text):
 
 
 def _all_checks(plan, reqs, completed, max_units, must_schedule, required_terms=(), forbidden_terms=(), min_units=0,
-                goal_term="", allow_summer=False):
+                goal_term="", allow_summer=False, term_system="quarter"):
     problems = check_plan(plan, reqs, completed, max_units, min_units)
     terms = [q["term"] for q in plan.get("quarters", [])]
-    problems += term_problems(terms, goal_term, allow_summer)
+    problems += term_problems(terms, goal_term, allow_summer, term_system)
     for t in required_terms:
         if t not in terms:
             problems.append(f"{t} was removed, but the student did not say it is over. "
@@ -213,14 +215,15 @@ def _all_checks(plan, reqs, completed, max_units, must_schedule, required_terms=
 
 
 def _generate_checked(system, payload, reqs, completed, max_units, max_repairs=1,
-                      required_terms=(), forbidden_terms=(), min_units=0, goal_term="", allow_summer=False):
+                      required_terms=(), forbidden_terms=(), min_units=0, goal_term="", allow_summer=False,
+                       term_system="quarter"):
     """Ask Claude for a plan, check it with code, and send problems back for repair."""
     must_schedule = {c["code"] for c in payload["courses_to_schedule"]}
     messages = [{"role": "user", "content": json.dumps(payload)}]
     text = _call(system, messages)
     plan = _extract_json(text)
     found = _all_checks(plan, reqs, completed, max_units, must_schedule,
-                        required_terms, forbidden_terms, min_units, goal_term, allow_summer)
+                        required_terms, forbidden_terms, min_units, goal_term, allow_summer, term_system)
     first_found = list(found)
 
     for _ in range(max_repairs):
@@ -234,7 +237,7 @@ def _generate_checked(system, payload, reqs, completed, max_units, max_repairs=1
         text = _call(system, messages)
         plan = _extract_json(text)
         found = _all_checks(plan, reqs, completed, max_units, must_schedule,
-                        required_terms, forbidden_terms, min_units, goal_term, allow_summer)
+                        required_terms, forbidden_terms, min_units, goal_term, allow_summer, term_system)
 
     return {"plan": plan, "issues_caught": first_found, "issues_remaining": found}
 
@@ -244,6 +247,11 @@ def _cannot_note(item):
         return "ASSIST says this course must be taken at the university after transfer."
     return ("ASSIST: No Course Articulated. Foothill has no approved course for it, so plan to take it "
             "at the university after transfer.")
+
+
+def _units_label(lo, hi):
+    """'4-6' for a range, '4.5' when the student picked a real course with exact units."""
+    return f"{lo:g}" if lo == hi else f"{lo:g}-{hi:g}"
 
 
 def finish_plan(plan, reqs):
@@ -259,9 +267,9 @@ def finish_plan(plan, reqs):
         for c in q.get("courses", []):
             r = ph.get(c.get("code"))
             if r:
-                c.update({"placeholder": True, "title": r["title"], "units_min": r["units_min"],
+                c.update({"placeholder": True, "title": r["title"], "units_min": r["units_min"], "units": r["units"],
                           "area_id": r["area_id"], "generic_title": r.get("generic_title", r["title"]),
-                          "units_max": r["units_max"], "units_label": f"{r['units_min']}-{r['units_max']}",
+                          "units_max": r["units_max"], "units_label": _units_label(r["units_min"], r["units_max"]),
                           "satisfies": f"Cal-GETC {r['area_id']}: {r['short']}"})
         q.update(quarter_hours(q.get("courses", [])))
     # These two lists come from the ASSIST data, not from Claude.
@@ -283,16 +291,17 @@ def covered_by_ap(reqs):
 
 
 def build_plan(major_label, campus, reqs, completed, max_units, start_term, goal_term, notes="", min_units=0,
-               allow_summer=False, work_hours=None):
+               allow_summer=False, work_hours=None, term_system="quarter", college=None):
     completed = set(completed)
     payload = {
-        "target": {"campus": campus, "major": major_label},
+        "target": {"campus": campus, "major": major_label, **({"community_college": college} if college else {})},
         "start_term": start_term,
         "transfer_goal": goal_term,
         "max_units_per_quarter": max_units,
         "min_units_per_quarter": min_units,
         "allow_summer_quarters": allow_summer,
-        "last_term_allowed": last_term_label(goal_term, allow_summer),
+        "term_system": term_system,
+        "last_term_allowed": last_term_label(goal_term, allow_summer, term_system),
         **({"student_work_hours_per_week": work_hours} if work_hours is not None else {}),
         "hours_per_unit_per_week": HOURS_PER_UNIT,
         "student_notes": notes,
@@ -302,13 +311,13 @@ def build_plan(major_label, campus, reqs, completed, max_units, start_term, goal
         "cannot_do_at_foothill_or_unknown": not_schedulable(reqs),
     }
     res = _generate_checked(SYSTEM, payload, reqs, completed, max_units, min_units=min_units,
-                            goal_term=goal_term, allow_summer=allow_summer)
+                            goal_term=goal_term, allow_summer=allow_summer, term_system=term_system)
     res["plan"] = finish_plan(res["plan"], reqs)
     return res
 
 
 def adjust_plan(old_plan, reqs, completed, change, max_units, goal_term, past_terms=(), failed=(), min_units=0,
-                allow_summer=False, work_hours=None):
+                allow_summer=False, work_hours=None, term_system="quarter"):
     """`completed` must already reflect the change (passed courses in, failed courses out).
     `past_terms` are quarters that are over. They are frozen into plan["past_quarters"]."""
     completed, failed, past_terms = set(completed), set(failed), list(past_terms)
@@ -333,7 +342,8 @@ def adjust_plan(old_plan, reqs, completed, change, max_units, goal_term, past_te
         "max_units_per_quarter": max_units,
         "min_units_per_quarter": min_units,
         "allow_summer_quarters": allow_summer,
-        "last_term_allowed": last_term_label(goal_term, allow_summer),
+        "term_system": term_system,
+        "last_term_allowed": last_term_label(goal_term, allow_summer, term_system),
         **({"student_work_hours_per_week": work_hours} if work_hours is not None else {}),
         "hours_per_unit_per_week": HOURS_PER_UNIT,
         "completed_courses": sorted(completed),
@@ -344,7 +354,7 @@ def adjust_plan(old_plan, reqs, completed, change, max_units, goal_term, past_te
     res = _generate_checked(ADJUST_SYSTEM, payload, reqs, completed, max_units,
                             required_terms=[q["term"] for q in future],
                             forbidden_terms=payload["quarters_already_passed"], min_units=min_units,
-                            goal_term=goal_term, allow_summer=allow_summer)
+                            goal_term=goal_term, allow_summer=allow_summer, term_system=term_system)
     res["plan"]["past_quarters"] = earlier + frozen
     res["plan"] = finish_plan(res["plan"], reqs)
     return res

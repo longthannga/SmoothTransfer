@@ -4,6 +4,8 @@ import json
 import re
 
 import streamlit as st
+
+from termwords import T as _T
 from streamlit_sortables import sort_items
 
 from validator import check_plan
@@ -99,7 +101,7 @@ def order_warnings(quarters):
     return sorted(set(out))
 
 
-def render_board(res, reqs, completed, max_units, min_units=0, units_before=0.0, units_note=""):
+def render_board(res, reqs, completed, max_units, min_units=0, units_before=0.0, units_note="", system="quarter"):
     """Show the draggable board. Returns True if the plan was changed and saved."""
     plan = res["plan"]
     by_label, containers = {}, []
@@ -118,8 +120,8 @@ def render_board(res, reqs, completed, max_units, min_units=0, units_before=0.0,
     shown_key = key + "-totals"
     shown = st.session_state.get(shown_key) or row_texts(quarter_totals(plan["quarters"], units_before, min_units),
                                                          min_units)
-    st.caption("Each row shows its units (under the quarter name), your running total of units by the end of "
-               f"that quarter, and about how many hours a week it takes ({HOURS_PER_UNIT} hours per unit).")
+    st.caption(_T("Each row shows its units (under the quarter name), your running total of units by the end of "
+                  f"that quarter, and about how many hours a week it takes ({HOURS_PER_UNIT} hours per unit).", system))
     new = sort_items(containers, multi_containers=True, direction="horizontal",
                      custom_style=CARD_STYLE + totals_css(shown), key=key)
 
@@ -136,7 +138,7 @@ def render_board(res, reqs, completed, max_units, min_units=0, units_before=0.0,
 
     problems = check_plan({"quarters": quarters}, reqs, completed, max_units, min_units) + order_warnings(quarters)
     for p in problems:
-        st.warning(p)
+        st.warning(_T(p, system))
     if not problems:
         st.success("This arrangement passes the checker.")
 
