@@ -1,0 +1,8 @@
+playwright
+anthropic
+python-dotenv
+streamlit
+streamlit-sortables
+pandas
+requests
+pypdf
